@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px/1.6 -apple-system, sans-serif;
+        width: 240px;
+        padding: 12px 14px;
+        margin: 0;
+      }
+      h1 { font-size: 13px; margin: 0 0 8px; }
+      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+      .on { background: #2ea043; }
+      .off { background: #cf222e; }
+      .hint { color: #666; font-size: 12px; margin-top: 8px; }
+      code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <h1>Chrome Bridge for Claude Code</h1>
+    <div><span id="dot" class="dot off"></span><span id="state">未连接</span></div>
+    <div class="hint">连接器地址 <code>ws://127.0.0.1:9333</code></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

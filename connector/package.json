@@ -1,0 +1,12 @@
+{
+  "name": "chrome-bridge-connector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把 Chrome Bridge 扩展的调试能力暴露为 MCP 工具",
+  "bin": { "chrome-bridge-connector": "index.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ws": "^8.18.0"
+  }
+}
