@@ -18,15 +18,18 @@
 const BASE_PORT = 9333;
 const PORT_SPAN = 20; // 必须与连接器 index.js 的 PORT_SPAN 一致
 const PROTOCOL = 2;
-const SCAN_MS = 1500;
+const SCAN_MS = 1000;
+const PROBE_TIMEOUT_MS = 800;
+const FOREIGN_RETRY_MS = 30000; // 端口上是别的程序: 少去打扰它
 const HANDSHAKE_MS = 3000;
-const KEEPALIVE_MS = 20000; // WebSocket 收发消息会延长 service worker 寿命, 间隔须小于 30 秒
+const KEEPALIVE_MS = 20000; // 扩展 API 调用与 WebSocket 消息会重置 service worker 的 30 秒空闲计时
 const PROTOCOL_VERSION = '1.3';
 const TAB_DOMAINS = ['Page', 'Runtime', 'Network', 'Log'];
 const CHILD_DOMAINS = ['Runtime', 'Network', 'Log'];
 
 const conns = new Map(); // port -> conn { port, ws, ready, info }
-const retryAt = new Map(); // port -> { fails, at }  连不上的端口退避重试
+const retryAt = new Map(); // port -> at  在此之前不再探测该端口
+const probing = new Set(); // 正在探测的端口
 const attached = new Map(); // key -> { d, owners: Set<conn> }
 const attaching = new Map(); // key -> Promise  并发附加去重
 const subscriptions = new Map(); // 'tabs.onUpdated' -> { ev, listener, conns: Set<conn> }
@@ -54,20 +57,42 @@ function send(conn, obj) {
   if (conn.ready && conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(obj));
 }
 
+// 发现: 先用普通 HTTP 探测, 确认端口上是连接器再建 WebSocket.
+// 不直接对每个端口开 WebSocket, 是因为 Chrome 会对连续失败的 WebSocket 连接限流
+// (实测一轮 20 个端口全失败后, 新连接被推迟 7-26 秒), 而 fetch 被拒不受此限,
+// 本机端口被拒只需几毫秒.
 function scan() {
   const now = Date.now();
   for (let port = BASE_PORT; port < BASE_PORT + PORT_SPAN; port++) {
-    if (conns.has(port)) continue;
-    const r = retryAt.get(port);
-    if (r && now < r.at) continue;
-    open(port);
+    if (conns.has(port) || probing.has(port) || now < (retryAt.get(port) || 0)) continue;
+    probe(port);
   }
 }
 
-// 连不上 (没有连接器) 的端口逐步拉长重试间隔, 上限 5 秒, 新会话最多等这么久就会被发现
-function backoff(port, ms) {
-  const fails = (retryAt.get(port)?.fails || 0) + 1;
-  retryAt.set(port, { fails, at: Date.now() + (ms ?? Math.min(500 * 2 ** fails, 5000)) });
+async function probe(port) {
+  probing.add(port);
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/chrome-bridge`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    const body = await r.text();
+    let info = null;
+    try {
+      info = JSON.parse(body);
+    } catch {}
+    // 2.0 版连接器没有探测地址, 对任何 HTTP 请求回 426 加这句话; 协议相同, 照样接入
+    const legacy = r.status === 426 && body.startsWith('chrome-bridge connector');
+    if (legacy || (info?.bridge === 'chrome-bridge' && info.protocol === PROTOCOL)) {
+      if (!conns.has(port)) open(port);
+    } else {
+      retryAt.set(port, Date.now() + FOREIGN_RETRY_MS);
+    }
+  } catch {
+    // 没人监听: 下一轮再探
+  } finally {
+    probing.delete(port);
+  }
 }
 
 function open(port) {
@@ -75,7 +100,7 @@ function open(port) {
   try {
     ws = new WebSocket(`ws://127.0.0.1:${port}`);
   } catch {
-    return backoff(port);
+    return retryAt.set(port, Date.now() + 2000);
   }
   const conn = { port, ws, ready: false, info: null };
   conns.set(port, conn);
@@ -117,7 +142,8 @@ function open(port) {
       retryAt.delete(port); // 端口很可能马上被新会话复用, 立即重扫
       publishStatus();
     } else {
-      backoff(port, ev.code === 4001 ? 10000 : undefined);
+      // 4001: 该连接器已服务另一个扩展实例 (另一个 Chrome profile)
+      retryAt.set(port, Date.now() + (ev.code === 4001 ? FOREIGN_RETRY_MS : 2000));
     }
   };
 
@@ -405,8 +431,9 @@ function dropSubscriber(path, conn) {
 }
 
 // ---------- 生命周期 ----------
-// MV3 的 service worker 会被回收. 有会话连着时, 定期的 keepalive 消息让它保持活着;
-// 没有会话时允许休眠, 由 alarm (最短 30 秒) 唤醒重扫. 弹窗打开时也会立即重扫.
+// MV3 的 service worker 空闲 30 秒会被回收, 回收后只能靠 alarm (最短 30 秒) 唤醒,
+// 新会话就得等那么久. 所以让它常驻: 每 20 秒调一次扩展 API 重置空闲计时.
+// alarm 仍保留, 万一被回收 (例如 Chrome 更新) 也能自己恢复.
 
 chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(scan);
@@ -421,6 +448,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 setInterval(scan, SCAN_MS);
 setInterval(() => {
+  chrome.runtime.getPlatformInfo();
   for (const c of readyConns()) send(c, { event: 'ping' });
 }, KEEPALIVE_MS);
 

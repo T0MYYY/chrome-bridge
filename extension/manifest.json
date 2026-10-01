@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Bridge for Claude Code",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "把本机 Chrome 的完整调试与扩展 API 能力桥接给 Claude Code。无需 --remote-debugging-port, 可直接用于默认 profile。",
   "permissions": [
     "activeTab",

@@ -20,7 +20,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { WebSocketServer } from 'ws';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const PROTOCOL = 2;
 const BASE_PORT = Number(process.env.CHROME_BRIDGE_PORT || 9333);
 const PORT_SPAN = 20; // 必须与扩展 background.js 的 PORT_SPAN 一致
@@ -145,6 +145,12 @@ function onCdpEvent(tabId, sessionId, method, p) {
 function tryListen(p) {
   return new Promise((resolve) => {
     const srv = http.createServer((req, res) => {
+      // 扩展先 GET 这个地址确认端口上是连接器, 再建 WebSocket (见扩展 probe()).
+      // 不加 CORS 头: 网页读不到响应, 也就探不出这里有什么.
+      if (req.method === 'GET' && req.url === '/chrome-bridge') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ bridge: 'chrome-bridge', protocol: PROTOCOL }));
+      }
       res.writeHead(426, { 'content-type': 'text/plain' });
       res.end('chrome-bridge connector: WebSocket only\n');
     });
