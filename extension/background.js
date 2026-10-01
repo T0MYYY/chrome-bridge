@@ -6,20 +6,30 @@
 //   events.*  订阅任意 chrome.* 事件并转发给连接器
 // 另保留 tabs.* 几个便捷方法.
 //
+// 多会话: 每个 Claude Code 会话有自己的连接器, 各占 9333 起的一个端口.
+// 这里扫描整个区间, 对每个连接器各维持一条连接 (conn). 命令从哪条连接来,
+// 结果就回哪条; 调试器附加与事件订阅按 conn 记账 (引用计数), 一个会话
+// detach 或退出, 只释放它自己的那份, 不会把别的会话正在用的标签断掉.
+//
 // 附加到标签页时会开启 Target.setAutoAttach (flatten), 跨站 iframe (OOPIF)
 // 与 worker 的子会话会被自动附加并打开 Network/Runtime/Log, 它们的事件
 // 带 sessionId 一并转发 — 否则这些请求对主会话是不可见的.
 
-const WS_URL = 'ws://127.0.0.1:9333';
+const BASE_PORT = 9333;
+const PORT_SPAN = 20; // 必须与连接器 index.js 的 PORT_SPAN 一致
+const PROTOCOL = 2;
+const SCAN_MS = 1500;
+const HANDSHAKE_MS = 3000;
+const KEEPALIVE_MS = 20000; // WebSocket 收发消息会延长 service worker 寿命, 间隔须小于 30 秒
 const PROTOCOL_VERSION = '1.3';
-const RECONNECT_MS = 3000;
 const TAB_DOMAINS = ['Page', 'Runtime', 'Network', 'Log'];
 const CHILD_DOMAINS = ['Runtime', 'Network', 'Log'];
 
-let ws = null;
-let reconnectTimer = null;
-const attached = new Map(); // key -> debuggee
-const subscriptions = new Map(); // 'tabs.onUpdated' -> listener
+const conns = new Map(); // port -> conn { port, ws, ready, info }
+const retryAt = new Map(); // port -> { fails, at }  连不上的端口退避重试
+const attached = new Map(); // key -> { d, owners: Set<conn> }
+const attaching = new Map(); // key -> Promise  并发附加去重
+const subscriptions = new Map(); // 'tabs.onUpdated' -> { ev, listener, conns: Set<conn> }
 
 const log = (...a) => console.log('[bridge]', ...a);
 
@@ -38,34 +48,39 @@ function toJSONSafe(v, depth = 0) {
   return out;
 }
 
-// ---------- WebSocket ----------
+// ---------- 连接管理 ----------
 
-function send(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+function send(conn, obj) {
+  if (conn.ready && conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(obj));
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect();
-  }, RECONNECT_MS);
-}
-
-function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  try {
-    ws = new WebSocket(WS_URL);
-  } catch {
-    scheduleReconnect();
-    return;
+function scan() {
+  const now = Date.now();
+  for (let port = BASE_PORT; port < BASE_PORT + PORT_SPAN; port++) {
+    if (conns.has(port)) continue;
+    const r = retryAt.get(port);
+    if (r && now < r.at) continue;
+    open(port);
   }
+}
 
-  ws.onopen = () => {
-    log('已连接到 MCP 连接器');
-    chrome.storage.local.set({ connected: true, lastConnect: Date.now() });
-    send({ event: 'hello', version: chrome.runtime.getManifest().version });
-  };
+// 连不上 (没有连接器) 的端口逐步拉长重试间隔, 上限 5 秒, 新会话最多等这么久就会被发现
+function backoff(port, ms) {
+  const fails = (retryAt.get(port)?.fails || 0) + 1;
+  retryAt.set(port, { fails, at: Date.now() + (ms ?? Math.min(500 * 2 ** fails, 5000)) });
+}
+
+function open(port) {
+  let ws;
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${port}`);
+  } catch {
+    return backoff(port);
+  }
+  const conn = { port, ws, ready: false, info: null };
+  conns.set(port, conn);
+  // 端口上可能是别的程序或旧版连接器: 限时内没收到 welcome 就放弃
+  const handshake = setTimeout(() => ws.close(), HANDSHAKE_MS);
 
   ws.onmessage = async (ev) => {
     let msg;
@@ -74,26 +89,72 @@ function connect() {
     } catch {
       return;
     }
+    if (!conn.ready) {
+      if (msg?.event !== 'welcome' || msg.bridge !== 'chrome-bridge' || msg.protocol !== PROTOCOL) return ws.close();
+      clearTimeout(handshake);
+      conn.ready = true;
+      conn.info = { pid: msg.pid, cwd: msg.cwd, version: msg.version, startedAt: msg.startedAt };
+      retryAt.delete(port);
+      log('已接入会话', port, msg.cwd);
+      send(conn, { event: 'hello', version: chrome.runtime.getManifest().version });
+      return publishStatus();
+    }
     if (!msg || msg.id === undefined) return;
     try {
-      const result = await handle(msg.method, msg.params || {});
-      send({ id: msg.id, ok: true, result });
+      const result = await handle(msg.method, msg.params || {}, conn);
+      send(conn, { id: msg.id, ok: true, result });
     } catch (e) {
-      send({ id: msg.id, ok: false, error: String((e && e.message) || e) });
+      send(conn, { id: msg.id, ok: false, error: String((e && e.message) || e) });
     }
   };
 
-  ws.onclose = () => {
-    ws = null;
-    chrome.storage.local.set({ connected: false });
-    scheduleReconnect();
+  ws.onclose = (ev) => {
+    clearTimeout(handshake);
+    if (conns.get(port) === conn) conns.delete(port);
+    if (conn.ready) {
+      log('会话断开', port);
+      release(conn);
+      retryAt.delete(port); // 端口很可能马上被新会话复用, 立即重扫
+      publishStatus();
+    } else {
+      backoff(port, ev.code === 4001 ? 10000 : undefined);
+    }
   };
 
-  ws.onerror = () => {
-    try {
-      ws.close();
-    } catch {}
+  ws.onerror = () => {};
+}
+
+// 会话断开: 释放它占用的调试器附加与事件订阅
+function release(conn) {
+  for (const [k, e] of attached) {
+    if (e.owners.delete(conn) && e.owners.size === 0) realDetach(k, e.d);
+  }
+  for (const path of [...subscriptions.keys()]) dropSubscriber(path, conn);
+}
+
+function readyConns() {
+  return [...conns.values()].filter((c) => c.ready);
+}
+
+function status(conn) {
+  return {
+    扩展版本: chrome.runtime.getManifest().version,
+    会话: readyConns().map((c) => ({
+      本会话: c === conn,
+      端口: c.port,
+      pid: c.info.pid,
+      目录: c.info.cwd,
+      启动于: new Date(c.info.startedAt).toLocaleString(),
+      附加的标签: [...attached].filter(([, e]) => e.owners.has(c)).map(([k]) => k),
+      订阅: [...subscriptions].filter(([, s]) => s.conns.has(c)).map(([p]) => p),
+    })),
   };
+}
+
+function publishStatus() {
+  chrome.storage.session
+    .set({ sessions: readyConns().map((c) => ({ port: c.port, pid: c.info.pid, cwd: c.info.cwd })) })
+    .catch(() => {});
 }
 
 // ---------- chrome.* 路径解析 ----------
@@ -110,23 +171,31 @@ function resolve(path) {
 
 // ---------- 命令分发 ----------
 
-async function handle(method, p) {
+async function handle(method, p, conn) {
+  await staleCleanup;
   switch (method) {
     case 'ping':
-      return { pong: Date.now(), attached: [...attached.keys()], subscriptions: [...subscriptions.keys()] };
+      return { pong: Date.now(), ...status(conn) };
+    case 'bridge.status':
+      return status(conn);
 
     // 便捷方法
     case 'tabs.list': {
       const tabs = await chrome.tabs.query({});
-      return tabs.map((t) => ({
-        tabId: t.id,
-        windowId: t.windowId,
-        title: t.title,
-        url: t.url,
-        active: t.active,
-        incognito: t.incognito,
-        attached: attached.has('tab:' + t.id),
-      }));
+      return tabs.map((t) => {
+        const owners = attached.get('tab:' + t.id)?.owners;
+        const mine = !!owners?.has(conn);
+        return {
+          tabId: t.id,
+          windowId: t.windowId,
+          title: t.title,
+          url: t.url,
+          active: t.active,
+          incognito: t.incognito,
+          attached: mine,
+          otherSessions: owners ? owners.size - (mine ? 1 : 0) : 0,
+        };
+      });
     }
     case 'tabs.create': {
       const opts = { url: p.url || 'about:blank', active: p.active !== false };
@@ -145,17 +214,14 @@ async function handle(method, p) {
       return toJSONSafe(await chrome.debugger.getTargets());
     case 'cdp.attach': {
       const d = debuggeeOf(p);
-      await ensureAttached(d, p.enableDomains !== false);
-      return { attached: keyOf(d) };
+      await ensureAttached(d, p.enableDomains !== false, conn);
+      return { attached: keyOf(d), otherSessions: attached.get(keyOf(d)).owners.size - 1 };
     }
-    case 'cdp.detach': {
-      const d = debuggeeOf(p);
-      await detach(d);
-      return { detached: keyOf(d) };
-    }
+    case 'cdp.detach':
+      return detach(debuggeeOf(p), conn);
     case 'cdp.send': {
       const d = debuggeeOf(p);
-      await ensureAttached(stripSession(d), p.enableDomains !== false);
+      await ensureAttached(stripSession(d), p.enableDomains !== false, conn);
       return (await chrome.debugger.sendCommand(d, p.cdpMethod, p.cdpParams || {})) ?? null;
     }
 
@@ -168,11 +234,11 @@ async function handle(method, p) {
 
     // 通用 chrome.* 事件
     case 'events.subscribe':
-      return subscribe(p.path);
+      return subscribe(p.path, conn);
     case 'events.unsubscribe':
-      return unsubscribe(p.path);
+      return unsubscribe(p.path, conn);
     case 'events.list':
-      return [...subscriptions.keys()];
+      return [...subscriptions].filter(([, s]) => s.conns.has(conn)).map(([path]) => path);
 
     default:
       throw new Error('未知方法: ' + method);
@@ -204,11 +270,31 @@ const stripSession = ({ sessionId, ...rest }) => rest;
 const keyOf = (d) =>
   d.tabId !== undefined ? 'tab:' + d.tabId : d.targetId !== undefined ? 'target:' + d.targetId : 'ext:' + d.extensionId;
 
-async function ensureAttached(d, enableDomains) {
+const keyOfSource = (s) => (s.tabId !== undefined ? 'tab:' + s.tabId : s.targetId !== undefined ? 'target:' + s.targetId : 'ext:' + s.extensionId);
+
+// 多个会话共用同一个附加: 第一个来的真正 attach, 后来的只登记为 owner
+// 附加进行中 (还在开 domain) 时后来的会话也要等它做完, 否则命令会早于 Network.enable 发出
+async function ensureAttached(d, enableDomains, conn) {
   const k = keyOf(d);
-  if (attached.has(k)) return;
-  await chrome.debugger.attach(d, PROTOCOL_VERSION);
-  attached.set(k, d);
+  if (attaching.has(k)) await attaching.get(k);
+  else if (!attached.has(k)) {
+    attaching.set(k, doAttach(d, enableDomains).finally(() => attaching.delete(k)));
+    await attaching.get(k);
+  }
+  const e = attached.get(k);
+  if (!e) throw new Error(k + ' 刚附加就被解除了 (标签关闭或用户点了取消), 请重试');
+  e.owners.add(conn);
+}
+
+async function doAttach(d, enableDomains) {
+  try {
+    await chrome.debugger.attach(d, PROTOCOL_VERSION);
+  } catch (e) {
+    const m = String((e && e.message) || e);
+    if (/already attached/i.test(m)) throw new Error('该页面已被其他调试器占用 (DevTools 或别的扩展), 无法附加: ' + m);
+    throw e;
+  }
+  attached.set(keyOf(d), { d, owners: new Set() });
   if (!enableDomains || d.tabId === undefined) return;
   for (const dom of TAB_DOMAINS) {
     await chrome.debugger.sendCommand(d, dom + '.enable', {}).catch((e) => log('enable 失败', dom, e));
@@ -232,13 +318,21 @@ async function prepareChild(child) {
   }
 }
 
-async function detach(d) {
-  const k = keyOf(d);
-  if (!attached.has(k)) return;
+async function detach(d, conn) {
+  const k = keyOf(stripSession(d));
+  const e = attached.get(k);
+  if (!e || !e.owners.has(conn)) return { detached: k, wasAttached: false };
+  e.owners.delete(conn);
+  if (e.owners.size > 0) return { detached: k, stillUsedBy: e.owners.size, 说明: '其他会话仍在使用, 黄条保留' };
+  await realDetach(k, e.d);
+  return { detached: k };
+}
+
+async function realDetach(k, d) {
+  attached.delete(k);
   try {
     await chrome.debugger.detach(d);
   } catch {}
-  attached.delete(k);
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -246,60 +340,88 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === 'Target.attachedToTarget' && params && params.sessionId && source.tabId !== undefined) {
     prepareChild({ tabId: source.tabId, sessionId: params.sessionId });
   }
-  send({
-    event: 'cdp',
-    tabId: source.tabId,
-    targetId: source.targetId,
-    sessionId: source.sessionId,
-    method,
-    params,
-  });
+  const e = attached.get(keyOfSource(source));
+  if (!e) return;
+  const msg = { event: 'cdp', tabId: source.tabId, targetId: source.targetId, sessionId: source.sessionId, method, params };
+  for (const c of e.owners) send(c, msg);
 });
 
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined) attached.delete('tab:' + source.tabId);
-  if (source.targetId !== undefined) attached.delete('target:' + source.targetId);
+// 用户点了黄条上的「取消」、标签关闭或页面崩溃: 通知所有在用的会话
+chrome.debugger.onDetach.addListener((source, reason) => {
+  const k = keyOfSource(source);
+  const e = attached.get(k);
+  if (!e) return;
+  attached.delete(k);
+  for (const c of e.owners) send(c, { event: 'detached', key: k, reason });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => attached.delete('tab:' + tabId));
 
-// ---------- chrome.* 事件订阅 ----------
+// service worker 重启后, 上一代留下的附加已无人记账: 启动时统一解除.
+// detach 只能解除本扩展自己的附加, 不会误伤 DevTools 或别的扩展.
+const staleCleanup = chrome.debugger
+  .getTargets()
+  .then((targets) =>
+    Promise.all(
+      targets
+        .filter((t) => t.attached)
+        .map((t) => chrome.debugger.detach(t.tabId !== undefined ? { tabId: t.tabId } : { targetId: t.id }).catch(() => {}))
+    )
+  )
+  .catch(() => {});
 
-async function subscribe(path) {
-  if (subscriptions.has(path)) return { subscribed: path, already: true };
-  const { member: ev } = resolve(path);
-  if (!ev || typeof ev.addListener !== 'function') throw new Error('chrome.' + path + ' 不是事件');
-  const listener = (...args) => send({ event: 'chrome', path, at: Date.now(), args: toJSONSafe(args) });
-  ev.addListener(listener);
-  subscriptions.set(path, listener);
-  await chrome.storage.local.set({ subscriptions: [...subscriptions.keys()] });
-  return { subscribed: path };
+// ---------- chrome.* 事件订阅 ----------
+// 每个事件只挂一个 listener, 转发给订阅了它的会话.
+
+function subscribe(path, conn) {
+  let s = subscriptions.get(path);
+  if (!s) {
+    const { member: ev } = resolve(path);
+    if (!ev || typeof ev.addListener !== 'function') throw new Error('chrome.' + path + ' 不是事件');
+    s = { ev, conns: new Set(), listener: null };
+    s.listener = (...args) => {
+      const msg = { event: 'chrome', path, at: Date.now(), args: toJSONSafe(args) };
+      for (const c of s.conns) send(c, msg);
+    };
+    ev.addListener(s.listener);
+    subscriptions.set(path, s);
+  }
+  const already = s.conns.has(conn);
+  s.conns.add(conn);
+  return already ? { subscribed: path, already: true } : { subscribed: path };
 }
 
-async function unsubscribe(path) {
-  const listener = subscriptions.get(path);
-  if (!listener) return { unsubscribed: path, wasSubscribed: false };
-  const { member: ev } = resolve(path);
-  ev.removeListener(listener);
+function unsubscribe(path, conn) {
+  const wasSubscribed = !!subscriptions.get(path)?.conns.has(conn);
+  dropSubscriber(path, conn);
+  return { unsubscribed: path, wasSubscribed };
+}
+
+function dropSubscriber(path, conn) {
+  const s = subscriptions.get(path);
+  if (!s || !s.conns.delete(conn) || s.conns.size > 0) return;
+  s.ev.removeListener(s.listener);
   subscriptions.delete(path);
-  await chrome.storage.local.set({ subscriptions: [...subscriptions.keys()] });
-  return { unsubscribed: path };
 }
 
 // ---------- 生命周期 ----------
-// MV3 的 service worker 会被回收: 用 alarm 定期唤醒重连, 并在启动时恢复事件订阅.
+// MV3 的 service worker 会被回收. 有会话连着时, 定期的 keepalive 消息让它保持活着;
+// 没有会话时允许休眠, 由 alarm (最短 30 秒) 唤醒重扫. 弹窗打开时也会立即重扫.
 
-chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener(() => {
-  connect();
-  send({ event: 'ping' });
+chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(scan);
+chrome.runtime.onStartup.addListener(scan);
+chrome.runtime.onInstalled.addListener(scan);
+
+chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  if (msg?.type !== 'status') return;
+  scan();
+  reply({ version: chrome.runtime.getManifest().version, basePort: BASE_PORT, span: PORT_SPAN, ...status(null) });
 });
 
-chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
+setInterval(scan, SCAN_MS);
+setInterval(() => {
+  for (const c of readyConns()) send(c, { event: 'ping' });
+}, KEEPALIVE_MS);
 
-chrome.storage.local.get('subscriptions').then(({ subscriptions: saved }) => {
-  for (const path of saved || []) subscribe(path).catch((e) => log('恢复订阅失败', path, e));
-});
-
-connect();
+scan();

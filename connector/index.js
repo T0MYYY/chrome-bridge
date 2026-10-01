@@ -8,15 +8,26 @@
 // 除便捷工具外, chrome_cdp / chrome_api / chrome_events 三个通用出口覆盖任意
 // CDP 方法、任意 chrome.* API 与事件, 新需求不必再改代码.
 //
+// 多会话: 每个 Claude Code 会话各起一个连接器, 各自占用 9333 起第一个空闲端口.
+// 扩展扫描整个端口区间, 对每个连接器各维持一条连接, 互不干扰; 会话退出,
+// 它的连接断开, 扩展随即释放它占用的调试器附加与事件订阅.
+//
 // 注意: stdout 专属于 MCP 协议, 所有日志必须走 stderr.
 
+import http from 'node:http';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { WebSocketServer } from 'ws';
 
-const PORT = Number(process.env.CHROME_BRIDGE_PORT || 9333);
+const VERSION = '2.0.0';
+const PROTOCOL = 2;
+const BASE_PORT = Number(process.env.CHROME_BRIDGE_PORT || 9333);
+const PORT_SPAN = 20; // 必须与扩展 background.js 的 PORT_SPAN 一致
+const EXT_WAIT_MS = 35000; // 扩展的 service worker 休眠时靠 30 秒一次的 alarm 唤醒, 留足余量
+const HEARTBEAT_MS = 15000;
 const RING = 2000;
+const STARTED_AT = Date.now();
 
 const err = (...a) => console.error('[connector]', ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -24,8 +35,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------------- 与扩展的连接 ----------------
 
 let sock = null;
+let port = null;
 let nextId = 1;
 const pending = new Map();
+const sockWaiters = new Set();
+const mySubs = new Set(); // 本会话订阅的 chrome.* 事件, 扩展重连后自动补订
 
 const netByTab = new Map(); // tabId -> Map<'session:requestId', rec>
 const logByTab = new Map(); // tabId -> rec[]
@@ -127,14 +141,76 @@ function onCdpEvent(tabId, sessionId, method, p) {
   }
 }
 
-const wss = new WebSocketServer({ host: '127.0.0.1', port: PORT });
-wss.on('listening', () => err(`WebSocket 服务已就绪 127.0.0.1:${PORT}, 等待扩展接入`));
-wss.on('error', (e) => err('WebSocket 服务出错:', e.message));
+// 端口: 从 BASE_PORT 起找第一个空闲的; 整段都被占就每 2 秒重试, 不需要人工重连.
+function tryListen(p) {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      res.writeHead(426, { 'content-type': 'text/plain' });
+      res.end('chrome-bridge connector: WebSocket only\n');
+    });
+    srv.once('error', () => resolve(null));
+    srv.listen(p, '127.0.0.1', () => resolve(srv));
+  });
+}
 
-wss.on('connection', (s) => {
-  err('扩展已接入');
+async function listen() {
+  for (;;) {
+    for (let p = BASE_PORT; p < BASE_PORT + PORT_SPAN; p++) {
+      const srv = await tryListen(p);
+      if (srv) return serve(srv, p);
+    }
+    err(`端口 ${BASE_PORT}-${BASE_PORT + PORT_SPAN - 1} 全被占用, 2 秒后重试`);
+    await sleep(2000);
+  }
+}
+
+function serve(srv, p) {
+  port = p;
+  const wss = new WebSocketServer({
+    server: srv,
+    // 网页也能连 127.0.0.1: 不校验来源的话, 任何页面都能冒充扩展, 给 Claude 喂假结果
+    verifyClient: ({ origin }) => typeof origin === 'string' && origin.startsWith('chrome-extension://'),
+  });
+  srv.on('error', (e) => err('监听出错:', e.message));
+  wss.on('connection', onConnection);
+  setInterval(heartbeat, HEARTBEAT_MS).unref();
+  err(`WebSocket 服务已就绪 127.0.0.1:${p}, 等待扩展接入`);
+}
+
+// 对端异常消失 (没有正常关闭) 时, 靠心跳发现并清掉, 让扩展能重新接入
+function heartbeat() {
+  if (!sock) return;
+  if (sock.alive === false) return sock.terminate();
+  sock.alive = false;
+  try {
+    sock.ping();
+  } catch {}
+}
+
+function onConnection(s) {
+  // 同一时刻只服务一个扩展实例 (例如两个 Chrome profile 都装了扩展), 先到先得
+  if (sock && sock.readyState === 1) return s.close(4001, 'busy');
+  s.alive = true;
+  s.on('pong', () => (s.alive = true));
+  s.send(
+    JSON.stringify({
+      event: 'welcome',
+      bridge: 'chrome-bridge',
+      protocol: PROTOCOL,
+      version: VERSION,
+      pid: process.pid,
+      cwd: process.cwd(),
+      startedAt: STARTED_AT,
+    })
+  );
   sock = s;
+  for (const w of sockWaiters) w();
+  sockWaiters.clear();
+  err('扩展已接入');
+  for (const path of mySubs) callExt('events.subscribe', { path }).catch((e) => err('补订失败', path, e.message));
+
   s.on('message', (raw) => {
+    s.alive = true;
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -143,6 +219,7 @@ wss.on('connection', (s) => {
     }
     if (msg.event === 'cdp') return onCdpEvent(msg.tabId, msg.sessionId, msg.method, msg.params || {});
     if (msg.event === 'chrome') return ringPush(chromeEvents, { path: msg.path, at: msg.at, args: msg.args });
+    if (msg.event === 'detached') return err('调试器已被解除:', msg.key, msg.reason || '');
     if (msg.event) return;
     const p = pending.get(msg.id);
     if (!p) return;
@@ -151,24 +228,51 @@ wss.on('connection', (s) => {
     if (msg.ok) p.resolve(msg.result);
     else p.reject(new Error(msg.error || '扩展返回错误'));
   });
+
   s.on('close', () => {
-    if (sock === s) sock = null;
+    if (sock !== s) return;
+    sock = null;
+    for (const p of pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error('与扩展的连接中断 (扩展被重新加载或 Chrome 已关闭), 请重试'));
+    }
+    pending.clear();
     err('扩展已断开');
   });
-});
+}
 
-function callExt(method, params = {}, timeoutMs = 60000) {
+function waitSock(ms) {
+  if (sock) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      sockWaiters.delete(done);
+      resolve(false);
+    }, ms);
+    sockWaiters.add(done);
+  });
+}
+
+async function callExt(method, params = {}, timeoutMs = 60000) {
+  if (!sock && !(await waitSock(EXT_WAIT_MS))) {
+    throw new Error(
+      `扩展未接入 (已等 ${EXT_WAIT_MS / 1000} 秒)。本会话的连接器` +
+        (port ? `监听在 127.0.0.1:${port}` : `还没抢到 ${BASE_PORT}-${BASE_PORT + PORT_SPAN - 1} 中的空闲端口`) +
+        '。请确认 Chrome 里 Chrome Bridge 扩展 (v2) 已启用; 点开它的弹窗能看到已接入的会话。'
+    );
+  }
+  const s = sock;
   return new Promise((resolve, reject) => {
-    if (!sock || sock.readyState !== 1) {
-      return reject(new Error('扩展未接入。请确认 Chrome 中已加载 Chrome Bridge 扩展, 且它的弹窗显示「已连接」。'));
-    }
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error('扩展响应超时: ' + method));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    sock.send(JSON.stringify({ id, method, params }));
+    s.send(JSON.stringify({ id, method, params }));
   });
 }
 
@@ -197,7 +301,14 @@ const tabIdProp = { type: 'number', description: '标签页 id, 由 chrome_tabs 
 const TOOLS = [
   {
     name: 'chrome_tabs',
-    description: '列出 Chrome 所有标签页 (tabId, windowId, 标题, URL, 是否无痕, 是否已附加调试器)。',
+    description:
+      '列出 Chrome 所有标签页 (tabId, windowId, 标题, URL, 是否无痕)。attached 表示本会话是否已附加调试器; ' +
+      'otherSessions > 0 表示另有 Claude 会话正在操作这个标签, 别去动它。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'chrome_status',
+    description: '查看桥接状态: 本会话的端口, 以及当前接入扩展的所有 Claude 会话 (pid、工作目录、各自附加的标签)。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -296,7 +407,9 @@ const TOOLS = [
   },
   {
     name: 'chrome_detach',
-    description: '解除对标签页的调试器附加, 页面顶部的黄色提示条随之消失。',
+    description:
+      '解除本会话对标签页的调试器附加。若没有其他会话在用这个标签, 黄色提示条随之消失; ' +
+      '若有, 只释放本会话的占用, 不影响对方 (返回的 stillUsedBy 是仍在用的会话数)。',
     inputSchema: { type: 'object', properties: { tabId: tabIdProp }, required: ['tabId'] },
   },
   {
@@ -341,7 +454,7 @@ const TOOLS = [
     name: 'chrome_events',
     description:
       '通用出口: 订阅 / 退订 / 读取任意 chrome.* 事件, 如 tabs.onUpdated、webNavigation.onCompleted、' +
-      'webRequest.onErrorOccurred。订阅跨 service worker 重启保留。',
+      'webRequest.onErrorOccurred。订阅属于本会话: 扩展重连后自动恢复, 会话结束自动退订。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -367,6 +480,12 @@ async function dispatch(name, a = {}) {
   switch (name) {
     case 'chrome_tabs':
       return text(await callExt('tabs.list'));
+
+    case 'chrome_status': {
+      const me = { 版本: VERSION, pid: process.pid, 端口: port, 扩展已接入: !!sock };
+      if (!sock) return text(me);
+      return text({ ...me, ...(await callExt('bridge.status')) });
+    }
 
     case 'chrome_new_tab':
       return text(await callExt('tabs.create', { url: a.url, active: a.active, windowId: a.windowId }));
@@ -459,9 +578,13 @@ async function dispatch(name, a = {}) {
 
     case 'chrome_events': {
       switch (a.action) {
-        case 'subscribe':
-          return text(await callExt('events.subscribe', { path: a.path }));
+        case 'subscribe': {
+          const r = await callExt('events.subscribe', { path: a.path });
+          mySubs.add(a.path);
+          return text(r);
+        }
         case 'unsubscribe':
+          mySubs.delete(a.path);
           return text(await callExt('events.unsubscribe', { path: a.path }));
         case 'list':
           return text(await callExt('events.list'));
@@ -504,10 +627,15 @@ const INSTRUCTIONS = `控制用户日常使用的 Chrome (默认 profile, 含其
 - 阻断请求做对照: chrome_cdp Network.setBlockedURLs (只作用于页面内的子资源与 fetch/XHR, 不拦顶层导航)。
 - 无痕窗口: chrome_api windows.create [{"incognito":true, "focused":false}] 得到 windowId, 再 chrome_new_tab {windowId}; 结束时 chrome_api windows.remove [windowId]。
 - 任意 chrome.* API 与事件: chrome_api / chrome_events。
-- 需要等待时用 chrome_wait, 不必借助 shell。`;
+- 需要等待时用 chrome_wait, 不必借助 shell。
+
+多会话:
+- 同一个 Chrome 可能同时被几个 Claude 会话使用, 各会话互不抢占。chrome_tabs 里 otherSessions > 0 的标签正被别的会话操作, 不要去碰。
+- chrome_detach 只释放本会话的占用; 会话结束时, 它附加的调试器与事件订阅会自动释放。
+- 报「扩展未接入」时, 用 chrome_status 看本会话端口与已接入的会话。`;
 
 const server = new Server(
-  { name: 'chrome-bridge', version: '1.0.0' },
+  { name: 'chrome-bridge', version: VERSION },
   { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
 );
 
@@ -523,3 +651,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 await server.connect(new StdioServerTransport());
 err('MCP 连接器已启动');
+
+// 会话结束 (stdin 关闭, 或父进程消失被过继给 launchd) 就退出, 不留孤儿进程占着端口
+process.stdin.on('end', () => process.exit(0));
+process.stdin.on('close', () => process.exit(0));
+setInterval(() => process.ppid === 1 && process.exit(0), 5000).unref();
+
+listen().catch((e) => err('监听失败:', e));

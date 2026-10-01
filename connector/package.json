@@ -1,6 +1,6 @@
 {
   "name": "chrome-bridge-connector",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "把 Chrome Bridge 扩展的调试能力暴露为 MCP 工具",
