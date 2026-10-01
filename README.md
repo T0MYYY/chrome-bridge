@@ -86,3 +86,7 @@ This bridge is powerful by design: anything that can talk to the connector can r
 ## Configuration
 
 `CHROME_BRIDGE_PORT` changes the connector's base port (default `9333`). If you change it, also change `BASE_PORT` in `extension/background.js`. `PORT_SPAN` (20) must match on both sides.
+
+## License
+
+[MIT](LICENSE)

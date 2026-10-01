@@ -86,3 +86,7 @@ cd chrome-bridge/connector && npm install
 ## 配置
 
 `CHROME_BRIDGE_PORT` 用来改连接器的起始端口（默认 `9333`）。改了它，也要同步改 `extension/background.js` 里的 `BASE_PORT`。两边的 `PORT_SPAN`（20）必须一致。
+
+## 许可证
+
+[MIT](LICENSE)

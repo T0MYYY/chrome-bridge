@@ -2,6 +2,7 @@
   "name": "chrome-bridge-connector",
   "version": "2.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "把 Chrome Bridge 扩展的调试能力暴露为 MCP 工具",
   "bin": { "chrome-bridge-connector": "index.js" },
