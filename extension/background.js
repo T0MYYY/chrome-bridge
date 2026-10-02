@@ -1,4 +1,4 @@
-// Chrome Bridge for Claude Code — service worker
+// Chrome Bridge — service worker
 //
 // 通过 WebSocket 连到本地 MCP 连接器. 提供三类通用出口, 新需求不必再改扩展:
 //   cdp.*     任意 Chrome DevTools Protocol 方法 (经 chrome.debugger, 无需调试端口)
@@ -6,28 +6,34 @@
 //   events.*  订阅任意 chrome.* 事件并转发给连接器
 // 另保留 tabs.* 几个便捷方法.
 //
-// 多会话: 每个 Claude Code 会话有自己的连接器, 各占 9333 起的一个端口.
+// 多会话: 每个 agent 会话有自己的连接器, 各占 9333 起的一个端口.
 // 这里扫描整个区间, 对每个连接器各维持一条连接 (conn). 命令从哪条连接来,
 // 结果就回哪条; 调试器附加与事件订阅按 conn 记账 (引用计数), 一个会话
 // detach 或退出, 只释放它自己的那份, 不会把别的会话正在用的标签断掉.
+//
+// 鉴权 (见 protocol.js / session.js): 每条连接先做双向签名握手、建立加密通道;
+// 只执行已配对 agent 的命令. 未配对的连接器只能发起配对请求, 由用户在弹窗里
+// 输入 agent 显示的配对码确认. 一个 agent 配对一次, 它以后的会话都免配对.
 //
 // 附加到标签页时会开启 Target.setAutoAttach (flatten), 跨站 iframe (OOPIF)
 // 与 worker 的子会话会被自动附加并打开 Network/Runtime/Log, 它们的事件
 // 带 sessionId 一并转发 — 否则这些请求对主会话是不可见的.
 
+import * as P from './protocol.js';
+import { ExtensionSide } from './session.js';
+
 const BASE_PORT = 9333;
 const PORT_SPAN = 20; // 必须与连接器 index.js 的 PORT_SPAN 一致
-const PROTOCOL = 2;
 const SCAN_MS = 1000;
 const PROBE_TIMEOUT_MS = 800;
 const FOREIGN_RETRY_MS = 30000; // 端口上是别的程序: 少去打扰它
-const HANDSHAKE_MS = 3000;
+const HANDSHAKE_MS = 5000;
 const KEEPALIVE_MS = 20000; // 扩展 API 调用与 WebSocket 消息会重置 service worker 的 30 秒空闲计时
 const PROTOCOL_VERSION = '1.3';
 const TAB_DOMAINS = ['Page', 'Runtime', 'Network', 'Log'];
 const CHILD_DOMAINS = ['Runtime', 'Network', 'Log'];
 
-const conns = new Map(); // port -> conn { port, ws, ready, info }
+const conns = new Map(); // port -> conn { port, ws, side, ready, pending, info }
 const retryAt = new Map(); // port -> at  在此之前不再探测该端口
 const probing = new Set(); // 正在探测的端口
 const attached = new Map(); // key -> { d, owners: Set<conn> }
@@ -51,10 +57,45 @@ function toJSONSafe(v, depth = 0) {
   return out;
 }
 
+// ---------- 身份与信任 ----------
+// 扩展的签名密钥不可导出, 存 IndexedDB (CryptoKey 只能存这里, chrome.storage 存不了).
+// 信任表存 chrome.storage.local: 已配对 agent 的连接器公钥, 以及被撤销的公钥.
+
+function kv(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('chrome-bridge', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('kv');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const req = fn(open.result.transaction('kv', mode).objectStore('kv'));
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    };
+  });
+}
+
+const identityReady = (async () => {
+  let id = await kv('readonly', (st) => st.get('identity'));
+  if (!id) {
+    const kp = await P.newSigningKey(false);
+    id = { sk: kp.privateKey, pub: await P.exportPub(kp.publicKey) };
+    await kv('readwrite', (st) => st.put(id, 'identity'));
+  }
+  return id;
+})();
+
+const trust = { agents: {}, revoked: [] };
+const trustReady = chrome.storage.local.get(['agents', 'revoked']).then((d) => {
+  trust.agents = d.agents || {};
+  trust.revoked = d.revoked || [];
+});
+const saveTrust = () => chrome.storage.local.set({ agents: trust.agents, revoked: trust.revoked.slice(-200) });
+const trustOf = (pub) => (trust.revoked.includes(pub) ? 'revoked' : trust.agents[pub] ? 'trusted' : null);
+
 // ---------- 连接管理 ----------
 
 function send(conn, obj) {
-  if (conn.ready && conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(obj));
+  if (conn.ready) conn.side.send(obj).catch(() => {});
 }
 
 // 发现: 先用普通 HTTP 探测, 确认端口上是连接器再建 WebSocket.
@@ -76,18 +117,9 @@ async function probe(port) {
       cache: 'no-store',
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    const body = await r.text();
-    let info = null;
-    try {
-      info = JSON.parse(body);
-    } catch {}
-    // 2.0 版连接器没有探测地址, 对任何 HTTP 请求回 426 加这句话; 协议相同, 照样接入
-    const legacy = r.status === 426 && body.startsWith('chrome-bridge connector');
-    if (legacy || (info?.bridge === 'chrome-bridge' && info.protocol === PROTOCOL)) {
-      if (!conns.has(port)) open(port);
-    } else {
-      retryAt.set(port, Date.now() + FOREIGN_RETRY_MS);
-    }
+    const info = await r.json().catch(() => null);
+    if (info?.bridge === 'chrome-bridge' && info.protocol === P.PROTOCOL) await open(port);
+    else retryAt.set(port, Date.now() + FOREIGN_RETRY_MS);
   } catch {
     // 没人监听: 下一轮再探
   } finally {
@@ -95,59 +127,88 @@ async function probe(port) {
   }
 }
 
-function open(port) {
+async function open(port) {
+  const identity = await identityReady;
+  await trustReady;
+  if (conns.has(port)) return;
   let ws;
   try {
     ws = new WebSocket(`ws://127.0.0.1:${port}`);
   } catch {
     return retryAt.set(port, Date.now() + 2000);
   }
-  const conn = { port, ws, ready: false, info: null };
+  ws.binaryType = 'arraybuffer';
+  const conn = { port, ws, side: null, ready: false, pending: false, info: {} };
   conns.set(port, conn);
-  // 端口上可能是别的程序或旧版连接器: 限时内没收到 welcome 就放弃
-  const handshake = setTimeout(() => ws.close(), HANDSHAKE_MS);
+  // 握手限时: 端口上可能是冒充者或卡住的程序
+  const handshake = setTimeout(() => !conn.ready && !conn.pending && ws.close(), HANDSHAKE_MS);
 
-  ws.onmessage = async (ev) => {
-    let msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch {
-      return;
+  conn.side = new ExtensionSide(
+    // close 不带 reason: 浏览器要求 reason 不超过 123 字节, 中文原因会超
+    { sendText: (d) => ws.send(d), sendBinary: (d) => ws.send(d), close: (code) => ws.close(code) },
+    {
+      identity,
+      trustOf,
+      onTrusted: (pub, info) => {
+        trust.agents[pub] = { ...(info.agent || {}), cwd: info.cwd, pairedAt: Date.now(), lastSeen: Date.now() };
+        saveTrust();
+      },
+      onReady: () => {
+        clearTimeout(handshake);
+        conn.ready = true;
+        conn.pending = false;
+        conn.info = conn.side.info;
+        retryAt.delete(port);
+        const a = trust.agents[conn.side.sC];
+        if (a) {
+          a.lastSeen = Date.now();
+          if (conn.info.agent?.client) a.client = conn.info.agent.client;
+          saveTrust();
+        }
+        log('已接入会话', port, conn.info.cwd);
+        refreshBadge();
+      },
+      onPending: () => {
+        clearTimeout(handshake);
+        if (conn.pending) return;
+        conn.pending = true;
+        conn.info = conn.side.info;
+        notifyPending(conn);
+        refreshBadge();
+      },
+      onMessage: (msg) => onCommand(conn, msg),
+      onFail: (reason) => log('拒绝连接', port, reason),
     }
-    if (!conn.ready) {
-      if (msg?.event !== 'welcome' || msg.bridge !== 'chrome-bridge' || msg.protocol !== PROTOCOL) return ws.close();
-      clearTimeout(handshake);
-      conn.ready = true;
-      conn.info = { pid: msg.pid, cwd: msg.cwd, version: msg.version, startedAt: msg.startedAt };
-      retryAt.delete(port);
-      log('已接入会话', port, msg.cwd);
-      send(conn, { event: 'hello', version: chrome.runtime.getManifest().version });
-      return publishStatus();
-    }
-    if (!msg || msg.id === undefined) return;
-    try {
-      const result = await handle(msg.method, msg.params || {}, conn);
-      send(conn, { id: msg.id, ok: true, result });
-    } catch (e) {
-      send(conn, { id: msg.id, ok: false, error: String((e && e.message) || e) });
-    }
-  };
+  );
+
+  ws.onmessage = (ev) => conn.side.receive(ev.data);
 
   ws.onclose = (ev) => {
     clearTimeout(handshake);
     if (conns.get(port) === conn) conns.delete(port);
+    chrome.notifications.clear('pair-' + port).catch(() => {});
     if (conn.ready) {
       log('会话断开', port);
       release(conn);
-      retryAt.delete(port); // 端口很可能马上被新会话复用, 立即重扫
-      publishStatus();
-    } else {
-      // 4001: 该连接器已服务另一个扩展实例 (另一个 Chrome profile)
-      retryAt.set(port, Date.now() + (ev.code === 4001 ? FOREIGN_RETRY_MS : 2000));
     }
+    // 会话断开或连接器换了密钥 (4004): 端口多半马上被复用, 立即重扫
+    if (conn.ready || conn.pending || ev.code === 4004) retryAt.delete(port);
+    // 4001: 该连接器已服务另一个扩展实例 (另一个 Chrome profile)
+    else retryAt.set(port, Date.now() + (ev.code === 4001 ? FOREIGN_RETRY_MS : 2000));
+    refreshBadge();
   };
 
   ws.onerror = () => {};
+}
+
+async function onCommand(conn, msg) {
+  if (!msg || msg.id === undefined) return;
+  try {
+    const result = await handle(msg.method, msg.params || {}, conn);
+    send(conn, { id: msg.id, ok: true, result });
+  } catch (e) {
+    send(conn, { id: msg.id, ok: false, error: String((e && e.message) || e) });
+  }
 }
 
 // 会话断开: 释放它占用的调试器附加与事件订阅
@@ -158,29 +219,90 @@ function release(conn) {
   for (const path of [...subscriptions.keys()]) dropSubscriber(path, conn);
 }
 
-function readyConns() {
-  return [...conns.values()].filter((c) => c.ready);
-}
+const readyConns = () => [...conns.values()].filter((c) => c.ready);
+const pendingConns = () => [...conns.values()].filter((c) => c.pending && !c.ready);
 
 function status(conn) {
   return {
     扩展版本: chrome.runtime.getManifest().version,
     会话: readyConns().map((c) => ({
       本会话: c === conn,
+      agent: c.info.agent?.label,
       端口: c.port,
       pid: c.info.pid,
       目录: c.info.cwd,
-      启动于: new Date(c.info.startedAt).toLocaleString(),
+      启动于: c.info.startedAt ? new Date(c.info.startedAt).toLocaleString() : null,
       附加的标签: [...attached].filter(([, e]) => e.owners.has(c)).map(([k]) => k),
       订阅: [...subscriptions].filter(([, s]) => s.conns.has(c)).map(([p]) => p),
     })),
   };
 }
 
-function publishStatus() {
-  chrome.storage.session
-    .set({ sessions: readyConns().map((c) => ({ port: c.port, pid: c.info.pid, cwd: c.info.cwd })) })
+// ---------- 配对提醒 ----------
+
+function refreshBadge() {
+  const n = pendingConns().length;
+  chrome.action.setBadgeText({ text: n ? String(n) : '' });
+  chrome.action.setBadgeBackgroundColor({ color: '#d4790b' });
+}
+
+function notifyPending(conn) {
+  const a = conn.info.agent || {};
+  chrome.notifications
+    .create('pair-' + conn.port, {
+      type: 'basic',
+      iconUrl: 'icon128.png',
+      title: '有 agent 请求控制 Chrome',
+      message: `${a.label || '未识别的 agent'}\n${conn.info.cwd || ''}`,
+      contextMessage: '点击输入 agent 显示的配对码; 不认识就忽略',
+      priority: 1,
+    })
     .catch(() => {});
+}
+
+chrome.notifications.onClicked.addListener((id) => {
+  if (!id.startsWith('pair-')) return;
+  chrome.notifications.clear(id);
+  chrome.action.openPopup().catch(() => {});
+});
+
+// ---------- 弹窗 ----------
+
+async function popupStatus() {
+  await trustReady;
+  const online = new Set(readyConns().map((c) => c.side.sC));
+  return {
+    version: chrome.runtime.getManifest().version,
+    basePort: BASE_PORT,
+    span: PORT_SPAN,
+    sessions: readyConns().map((c) => ({ port: c.port, pid: c.info.pid, cwd: c.info.cwd, agent: c.info.agent?.label, tabs: [...attached.values()].filter((e) => e.owners.has(c)).length })),
+    pending: pendingConns().map((c) => ({ port: c.port, cwd: c.info.cwd, agent: c.info.agent?.label, strength: c.info.agent?.strength })),
+    agents: await Promise.all(
+      Object.entries(trust.agents).map(async ([pub, a]) => ({ pub, fp: await P.fingerprint(pub), label: a.label, client: a.client, strength: a.strength, pairedAt: a.pairedAt, lastSeen: a.lastSeen, online: online.has(pub) }))
+    ),
+  };
+}
+
+// 用户输入的码发给所有待配对的连接, 只有显示这个码的那个连接器能给出正确的回应.
+// 发给冒充者也无妨: 它拿到的证明经 PBKDF2 且有 40 bit 熵, 无法反推出码.
+async function pairWith(code) {
+  const list = pendingConns();
+  if (!list.length) return { ok: false, error: '没有待配对的 agent' };
+  if (P.normalizeCode(code).length !== 8) return { ok: false, error: '配对码是 8 位' };
+  const results = await Promise.all(list.map(async (c) => ((await c.side.pair(code)) ? c : null)));
+  const hit = results.find(Boolean);
+  if (!hit) return { ok: false, error: '配对码不对 (连续错 3 次后 agent 会换新码)' };
+  chrome.notifications.clear('pair-' + hit.port).catch(() => {});
+  return { ok: true, agent: hit.info.agent?.label };
+}
+
+async function revoke(pub) {
+  delete trust.agents[pub];
+  if (!trust.revoked.includes(pub)) trust.revoked.push(pub);
+  await saveTrust();
+  // 断开它现有的连接; 重连时会被告知已撤销, 连接器随即换新密钥, 需要重新配对
+  for (const c of conns.values()) if (c.side?.sC === pub) c.ws.close();
+  return { ok: true };
 }
 
 // ---------- chrome.* 路径解析 ----------
@@ -440,10 +562,13 @@ chrome.alarms.onAlarm.addListener(scan);
 chrome.runtime.onStartup.addListener(scan);
 chrome.runtime.onInstalled.addListener(scan);
 
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-  if (msg?.type !== 'status') return;
-  scan();
-  reply({ version: chrome.runtime.getManifest().version, basePort: BASE_PORT, span: PORT_SPAN, ...status(null) });
+// 只接受本扩展自己页面 (弹窗) 的消息
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (sender.id !== chrome.runtime.id || sender.tab) return;
+  const run = { status: () => (scan(), popupStatus()), pair: () => pairWith(msg.code), revoke: () => revoke(msg.pub) }[msg?.type];
+  if (!run) return;
+  run().then(reply, (e) => reply({ ok: false, error: String((e && e.message) || e) }));
+  return true;
 });
 
 setInterval(scan, SCAN_MS);

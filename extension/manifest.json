@@ -1,8 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "Chrome Bridge for Claude Code",
-  "version": "2.1.0",
-  "description": "把本机 Chrome 的完整调试与扩展 API 能力桥接给 Claude Code。无需 --remote-debugging-port, 可直接用于默认 profile。",
+  "name": "Chrome Bridge",
+  "version": "3.0.0",
+  "description": "MCP bridge to your everyday Chrome: lets paired AI agents drive your real profile via chrome.debugger, no remote-debugging port.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "permissions": [
     "activeTab",
     "alarms",
@@ -42,13 +47,19 @@
     "webNavigation",
     "webRequest"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "Chrome Bridge (点击查看连接状态)",
-    "default_popup": "popup.html"
+    "default_title": "Chrome Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png"
+    }
   }
 }

@@ -1,10 +1,10 @@
 {
   "name": "chrome-bridge-connector",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "把 Chrome Bridge 扩展的调试能力暴露为 MCP 工具",
+  "description": "MCP server that lets paired AI agents drive your everyday Chrome through the Chrome Bridge extension",
   "bin": { "chrome-bridge-connector": "index.js" },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
