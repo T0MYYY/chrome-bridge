@@ -102,6 +102,12 @@ check('撤销后连接器换新密钥并要求重新配对', r.err && !!codeIn(r
 const bad = await new Promise((res) => { const w = new WebSocket(`ws://127.0.0.1:${pa}`, { origin: 'https://evil.example' }); w.on('unexpected-response', (_q, x) => res(x.statusCode)); w.on('open', () => res('open')); w.on('error', () => {}); });
 check('网页来源被拒', bad === 401, String(bad));
 
+// 8. 探测地址: 扩展靠 bridge 字段识别, connector 字段标明是哪个连接器; core 可被其他连接器复用
+const probe = await (await fetch(`http://127.0.0.1:${pa}/chrome-bridge`)).json();
+check('探测返回 bridge 与 connector 名', probe.bridge === 'chrome-bridge' && probe.connector === 'chrome-bridge' && probe.protocol === P.PROTOCOL, JSON.stringify(probe));
+const core = await import('../connector/core.js').catch((x) => ({ err: x.message }));
+check('core.js 导出 createBridge', typeof core.createBridge === 'function', core.err || '');
+
 for (const p of [A, B, C]) await p.end();
 for (const x of [e, e2b, e3, e4]) try { x.close(); } catch {}
 
