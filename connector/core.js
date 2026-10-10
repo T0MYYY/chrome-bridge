@@ -29,6 +29,10 @@ export function createBridge({ name, version, onCdpEvent = () => {}, onChromeEve
   const startedAt = Date.now();
 
   let port = null;
+  let httpServer = null;
+  let wsServer = null;
+  let heartbeatTimer = null;
+  let closed = false;
   let nextId = 1;
   const pending = new Map();
   const mySubs = new Set(); // 本会话订阅的 chrome.* 事件, 扩展重连后自动补订
@@ -149,9 +153,10 @@ export function createBridge({ name, version, onCdpEvent = () => {}, onChromeEve
 
   async function listen() {
     await identityReady;
-    for (;;) {
+    while (!closed) {
       for (let p = BASE_PORT; p < BASE_PORT + PORT_SPAN; p++) {
         const srv = await tryListen(p);
+        if (srv && closed) return srv.close();
         if (srv) return serve(srv, p);
       }
       err(`端口 ${BASE_PORT}-${BASE_PORT + PORT_SPAN - 1} 全被占用, 2 秒后重试`);
@@ -161,15 +166,17 @@ export function createBridge({ name, version, onCdpEvent = () => {}, onChromeEve
 
   function serve(srv, p) {
     port = p;
-    const wss = new WebSocketServer({
+    httpServer = srv;
+    const wss = (wsServer = new WebSocketServer({
       server: srv,
       maxPayload: 256 * 1024 * 1024,
       // 第一道筛子: 网页也能连 127.0.0.1, 但带不了 chrome-extension:// 来源. 真正的鉴权在握手里
       verifyClient: ({ origin }) => typeof origin === 'string' && origin.startsWith('chrome-extension://'),
-    });
+    }));
     srv.on('error', (e) => err('监听出错:', e.message));
     wss.on('connection', onConnection);
-    setInterval(heartbeat, HEARTBEAT_MS).unref();
+    heartbeatTimer = setInterval(heartbeat, HEARTBEAT_MS);
+    heartbeatTimer.unref();
     err(`WebSocket 服务已就绪 127.0.0.1:${p}, 等待扩展接入`);
   }
 
@@ -359,6 +366,15 @@ export function createBridge({ name, version, onCdpEvent = () => {}, onChromeEve
     return callExt('events.unsubscribe', { path });
   }
 
+  // 进程内使用 (如测试) 时释放端口与连接, 让进程能自然退出
+  async function close() {
+    closed = true;
+    clearInterval(heartbeatTimer);
+    for (const c of sides) c.ws.terminate();
+    await new Promise((r) => (wsServer ? wsServer.close(() => r()) : r()));
+    await new Promise((r) => (httpServer ? httpServer.close(() => r()) : r()));
+  }
+
   const identityReady = loadIdentity();
   listen().catch((e) => err('监听失败:', e));
 
@@ -373,6 +389,7 @@ export function createBridge({ name, version, onCdpEvent = () => {}, onChromeEve
     sessionInfo,
     subscribe,
     unsubscribe,
+    close,
     get port() {
       return port;
     },

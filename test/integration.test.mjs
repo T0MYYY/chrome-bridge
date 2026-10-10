@@ -108,6 +108,15 @@ check('探测返回 bridge 与 connector 名', probe.bridge === 'chrome-bridge' 
 const core = await import('../connector/core.js').catch((x) => ({ err: x.message }));
 check('core.js 导出 createBridge', typeof core.createBridge === 'function', core.err || '');
 
+// 9. 进程内使用 core: close() 之后端口释放, 进程可以正常退出
+const inproc = core.createBridge({ name: 'inproc-test', version: '0' });
+for (let i = 0; i < 50 && !inproc.port; i++) await sleep(100);
+const ipPort = inproc.port;
+const before = await fetch(`http://127.0.0.1:${ipPort}/chrome-bridge`).then((x) => x.json()).catch(() => null);
+await inproc.close?.();
+const after = await fetch(`http://127.0.0.1:${ipPort}/chrome-bridge`).then(() => 'open').catch(() => 'closed');
+check('core.close() 释放端口', before?.connector === 'inproc-test' && after === 'closed', `${ipPort} ${after}`);
+
 for (const p of [A, B, C]) await p.end();
 for (const x of [e, e2b, e3, e4]) try { x.close(); } catch {}
 
