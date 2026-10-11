@@ -117,6 +117,7 @@ The extension requests broad permissions (`debugger`, `<all_urls>`, and more) so
 ```bash
 node test/protocol.test.mjs      # handshake, pairing, attack cases (in-memory)
 node test/integration.test.mjs   # real connector processes + simulated extension
+node test/agent.test.mjs         # agent identification: skips shell / npm launchers
 ```
 
 `CHROME_BRIDGE_PORT` changes the connector's base port (default `9333`). If you change it, also change `BASE_PORT` in `extension/background.js`. `PORT_SPAN` (20) must match on both sides.

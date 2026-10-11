@@ -117,6 +117,7 @@ cd chrome-bridge/connector && npm install
 ```bash
 node test/protocol.test.mjs      # 握手、配对与各类攻击场景 (内存中)
 node test/integration.test.mjs   # 真实连接器进程 + 模拟扩展
+node test/agent.test.mjs         # agent 识别: 跳过 shell / npm 等启动层
 ```
 
 `CHROME_BRIDGE_PORT` 用来改连接器的起始端口（默认 `9333`）。改了它，也要同步改 `extension/background.js` 里的 `BASE_PORT`。两边的 `PORT_SPAN`（20）必须一致。

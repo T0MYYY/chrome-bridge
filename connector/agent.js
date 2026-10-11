@@ -52,13 +52,16 @@ async function codesignOf(pid) {
   return { team, identifier, org };
 }
 
+// 启动层: shell、npx/npm 等. npm 会把进程标题改成 "npm run x" / "npm exec x", 所以按第一个词判断
+export function isLauncher(p) {
+  const first = p.base.split(/\s+/)[0];
+  const viaNodeWrapper = NODE_LIKE.has(first) && NODE_WRAPPERS.test(scriptOf(p.args));
+  return SHELLS.has(first) || viaNodeWrapper || NODE_WRAPPERS.test(first);
+}
+
 export async function identifyAgent() {
   let p = await proc(process.ppid);
-  for (let hops = 0; p && hops < 6; hops++) {
-    const viaNodeWrapper = NODE_LIKE.has(p.base) && NODE_WRAPPERS.test(scriptOf(p.args));
-    if (!SHELLS.has(p.base) && !viaNodeWrapper && !NODE_WRAPPERS.test(p.base)) break;
-    p = p.ppid > 1 ? await proc(p.ppid) : null;
-  }
+  for (let hops = 0; p && hops < 6 && isLauncher(p); hops++) p = p.ppid > 1 ? await proc(p.ppid) : null;
   if (!p || p.pid <= 1) return null;
 
   if (process.platform === 'darwin') {
